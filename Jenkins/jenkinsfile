@@ -1,0 +1,220 @@
+pipeline {
+    agent {
+        label "KloverBuy-Slave"
+    }
+    environment {
+        DOCKER_IMAGE = 'dockerhub/kloverbuy'
+        REMOTE_SERVER_IP = 'YOUR_REMOTE_SERVER_IP'
+        CONTAINER_NAME = 'KloverBuy'
+        SSH_CREDENTIALS_ID = 'KloverBuy-SSH'
+        DOCKER_CREDENTIALS_ID = 'DockerHub'
+        SONARQUBE_URL = 'https://sonar.kloverbuy.com/'
+        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64' 
+        PATH = "${JAVA_HOME}/bin:${env.PATH}"
+        SONAR_SCANNER_OPTS = '-Djavax.net.ssl.trustStorePassword=changeit -Djavax.net.ssl.trustStore=${JAVA_HOME}/lib/security/cacerts'
+    }
+    
+    stages {
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout([$class: 'GitSCM',
+                          branches: [[name: 'main']],
+                          userRemoteConfigs: [[url: 'https://github.com/KloverBuy.git',
+                                               credentialsId: 'GitHub']]
+                ])
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('Sonar-Server') {
+                    withCredentials([string(credentialsId: 'Sonar-Admin-Token', variable: 'SONAR_TOKEN')]) {
+                        withEnv(["SONAR_SCANNER_OPTS=${SONAR_SCANNER_OPTS}"]) {
+                            sh '''
+                            java -version
+                            /opt/sonar-scanner/bin/sonar-scanner \
+                            -Dsonar.projectKey=KloverBuy \
+                            -Dsonar.sources=. \
+                            -Dsonar.host.url=${SONARQUBE_URL} \
+                            -Dsonar.token=${SONAR_TOKEN} \
+                            -X
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    def sonarProjectKey = 'KloverBuy'
+                    def sonarHostUrl = 'https://sonar.kloverbuy.com'
+
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitUntil {
+                            echo "Checking quality gate status..."
+                            withCredentials([string(credentialsId: 'Sonar-Admin-Token', variable: 'SONAR_TOKEN')]) {
+                                def response = sh(script: "curl -s -u ${SONAR_TOKEN}: '${sonarHostUrl}/api/qualitygates/project_status?projectKey=${sonarProjectKey}'", returnStdout: true)
+                                echo "Response Content: ${response}"
+
+                                def json
+                                try {
+                                    json = readJSON(text: response)
+                                } catch (Exception e) {
+                                    error "Failed to parse JSON response: ${e.message}"
+                                }
+
+                                def qualityGateStatus = json.projectStatus.status
+                                echo "Quality Gate Status: ${qualityGateStatus}"
+
+                                if (qualityGateStatus == 'OK') {
+                                    return true
+                                } else if (qualityGateStatus == 'ERROR') {
+                                    error "Quality Gate failed with status: ${qualityGateStatus}"
+                                } else {
+                                    echo "Waiting for quality gate result..."
+                                    return false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build & Install Dependencies') {
+            steps {
+                nodejs(cacheLocationStrategy: workspace(), nodeJSInstallationName: '20.13.1') {
+                    sh 'npm install --force'
+                    sh 'npm install cross-env --force'
+                    sh 'npm install react-scripts --force'
+                    sh 'npm run build'
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def imageTag = "${env.BUILD_NUMBER}"
+                    sh "docker build -t ${DOCKER_IMAGE}:${imageTag} ."
+                    sh "docker tag ${DOCKER_IMAGE}:${imageTag} ${DOCKER_IMAGE}:latest"
+                }
+            }
+        }
+
+        stage('Push Docker Image to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS_ID}", usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    script {
+                        def imageTag = "${env.BUILD_NUMBER}"
+                        sh """
+                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin
+                        docker push ${DOCKER_IMAGE}:${imageTag}
+                        docker push ${DOCKER_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Remove Local Docker Image') {
+            steps {
+                script {
+                    def imageTag = "${env.BUILD_NUMBER}"
+                    sh """
+                    docker rmi ${DOCKER_IMAGE}:${imageTag} ${DOCKER_IMAGE}:latest || true
+                    """
+                }
+            }
+        }
+
+        stage('Test Docker Image') {
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'UserInput', 
+                        message: 'Test Docker Image', 
+                        parameters: [
+                            choice(name: 'RESULT', choices: 'Pass\nFail', description: 'Did the Docker image pass the tests?')
+                        ]
+                    )
+
+                    if (userInput == 'Fail') {
+                        error 'Docker Image test failed.'
+                    }
+                }
+            }
+        }
+
+        stage('Pull Docker Image from Remote Server') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: SSH_CREDENTIALS_ID, usernameVariable: 'SSH_USER', passwordVariable: 'SSH_PASSWORD')]) {
+                        withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASSWORD')]) {
+                            def imageTag = "latest"
+                            sh """
+                            sshpass -p '${SSH_PASSWORD}' ssh -o StrictHostKeyChecking=no ${SSH_USER}@${REMOTE_SERVER_IP} \
+                            "echo '${DOCKER_PASSWORD}' | docker login -u ${DOCKER_USER} --password-stdin && \
+                            docker pull ${DOCKER_IMAGE}:${imageTag}"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Stop Running Container on Remote Server') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: SSH_CREDENTIALS_ID, usernameVariable: 'SSH_USER', passwordVariable: 'SSH_PASSWORD')]) {
+                        sh """
+                        sshpass -p '${SSH_PASSWORD}' ssh -o StrictHostKeyChecking=no ${SSH_USER}@${REMOTE_SERVER_IP} "docker stop ${CONTAINER_NAME} || true && docker rm ${CONTAINER_NAME} || true"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy New Container on Remote Server') {
+            steps {
+                script {
+                    def imageTag = "latest"
+                    withCredentials([usernamePassword(credentialsId: SSH_CREDENTIALS_ID, usernameVariable: 'SSH_USER', passwordVariable: 'SSH_PASSWORD')]) {
+                        sh """
+                        sshpass -p '${SSH_PASSWORD}' ssh -o StrictHostKeyChecking=no ${SSH_USER}@${REMOTE_SERVER_IP} "docker run -itd --name ${CONTAINER_NAME} -p 8000:8000 ${DOCKER_IMAGE}:${imageTag}"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Send Email Notification') {
+            steps {
+                emailext(
+                    attachLog: true,
+                    to: 'devops-team@gtechwebsolutions.com, developers@gtechwebsolutions.com',
+                    subject: '$DEFAULT_SUBJECT',
+                    mimeType: 'text/html',
+                    body: '''
+                    <h2>Deployment Notification</h2>
+                    <p>Hello Team,</p>
+                    <p>The latest build of KloverBuy has been successfully deployed.</p>
+                    <p>Visit the website: <a href="https://kloverbuy.com/">KloverBuy</a></p>
+                    <p>Best Regards, <br> DevOps Team</p>
+                    ''',
+                    from: 'jenkins@gtechwebsolutions.com',
+                    replyTo: 'ajees@gtechwebsolutions.com',
+                    attachmentsPattern: '**/build.log'
+                )
+            }
+        }
+    }
+}
