@@ -106,11 +106,11 @@ graph TD
 
 ---
 ## 🏆 **Benefits of New Relic in KloverBuy:**
-✔️ Optimized MySQL queries for better response time.
-✔️ Improved application performance with proactive monitoring.
-✔️ Reduced downtime through real-time database health tracking.
-✔️ Faster debugging with query logs and alerts.
-✔️ Enhanced user experience by minimizing slow queries.
+✔️ **Optimized MySQL queries for better response time.**
+✔️ **Improved application performance with proactive monitoring.**
+✔️ **Reduced downtime through real-time database health tracking.**
+✔️ **Faster debugging with query logs and alerts.**
+✔️**Enhanced user experience by minimizing slow queries.**
 
 ---
 
